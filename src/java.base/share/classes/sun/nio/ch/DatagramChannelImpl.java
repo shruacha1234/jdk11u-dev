@@ -99,8 +99,7 @@ class DatagramChannelImpl
     private static final int ST_UNCONNECTED = 0;
     private static final int ST_CONNECTED = 1;
     private static final int ST_CLOSING = 2;
-    private static final int ST_KILLPENDING = 3;
-    private static final int ST_KILLED = 4;
+    private static final int ST_CLOSED = 3;
     private int state;
 
     // IDs of native threads doing reads and writes, for signalling
@@ -388,9 +387,8 @@ class DatagramChannelImpl
         if (blocking) {
             synchronized (stateLock) {
                 readerThread = 0;
-                // notify any thread waiting in implCloseSelectableChannel
                 if (state == ST_CLOSING) {
-                    stateLock.notifyAll();
+                    tryFinishClose();
                 }
             }
             // remove hook for Thread.interrupt
@@ -687,9 +685,8 @@ class DatagramChannelImpl
         if (blocking) {
             synchronized (stateLock) {
                 writerThread = 0;
-                // notify any thread waiting in implCloseSelectableChannel
                 if (state == ST_CLOSING) {
-                    stateLock.notifyAll();
+                    tryFinishClose();
                 }
             }
             // remove hook for Thread.interrupt
@@ -797,7 +794,7 @@ class DatagramChannelImpl
     }
 
     private void bindInternal(SocketAddress local) throws IOException {
-        assert Thread.holdsLock(stateLock) && (localAddress == null);
+        assert Thread.holdsLock(stateLock )&& (localAddress == null);
 
         InetSocketAddress isa;
         if (local == null) {
@@ -1128,29 +1125,74 @@ class DatagramChannelImpl
     }
 
     /**
-     * Invoked by implCloseChannel to close the channel.
-     *
-     * This method waits for outstanding I/O operations to complete. When in
-     * blocking mode, the socket is pre-closed and the threads in blocking I/O
-     * operations are signalled to ensure that the outstanding I/O operations
-     * complete quickly.
-     *
-     * The socket is closed by this method when it is not registered with a
-     * Selector. Note that a channel configured blocking may be registered with
-     * a Selector. This arises when a key is canceled and the channel configured
-     * to blocking mode before the key is flushed from the Selector.
+     * Closes the socket if there are no I/O operations in progress and the
+     * channel is not registered with a Selector.
      */
-    @Override
-    protected void implCloseSelectableChannel() throws IOException {
-        assert !isOpen();
+    private boolean tryClose() throws IOException {
+        assert Thread.holdsLock(stateLock) && state == ST_CLOSING;
+        if ((readerThread == 0) && (writerThread == 0) && !isRegistered()) {
+            state = ST_CLOSED;
+            try {
+                nd.close(fd);
+            } finally {
+                // notify resource manager
+                ResourceManager.afterUdpClose();
+            }
+            return true;
+        } else {
+            return false;
+        }
+    }
 
-        boolean blocking;
-        boolean interrupted = false;
+    /**
+     * Invokes tryClose to attempt to close the socket.
+     *
+     * This method is used for deferred closing by I/O and Selector operations.
+     */
+    private void tryFinishClose() {
+        try {
+            tryClose();
+        } catch (IOException ignore) { }
+    }
 
-        // set state to ST_CLOSING and invalid membership keys
+    /**
+     * Closes this channel when configured in blocking mode.
+     *
+     * If there is an I/O operation in progress then the socket is pre-closed
+     * and the I/O threads signalled, in which case the final close is deferred
+     * until all I/O operations complete.
+     */
+    private void implCloseBlockingMode() throws IOException {
         synchronized (stateLock) {
             assert state < ST_CLOSING;
-            blocking = isBlocking();
+            state = ST_CLOSING;
+
+            // if member of any multicast groups then invalidate the keys
+            if (registry != null)
+                registry.invalidateAll();
+            if (!tryClose()) {
+                long reader = readerThread;
+                long writer = writerThread;
+                if (reader != 0 || writer != 0) {
+                    nd.preClose(fd);
+                    if (reader != 0)
+                        NativeThread.signal(reader);
+                    if (writer != 0)
+                        NativeThread.signal(writer);
+                }
+            }
+        }
+    }
+
+    /**
+     * Closes this channel when configured in non-blocking mode.
+     *
+     * If the channel is registered with a Selector then the close is deferred
+     * until the channel is flushed from all Selectors.
+     */
+    private void implCloseNonBlockingMode() throws IOException {
+        synchronized (stateLock) {
+            assert state < ST_CLOSING;
             state = ST_CLOSING;
 
             // if member of any multicast groups then invalidate the keys
@@ -1158,67 +1200,36 @@ class DatagramChannelImpl
                 registry.invalidateAll();
         }
 
-        // wait for any outstanding I/O operations to complete
-        if (blocking) {
-            synchronized (stateLock) {
-                assert state == ST_CLOSING;
-                long reader = readerThread;
-                long writer = writerThread;
-                if (reader != 0 || writer != 0) {
-                    nd.preClose(fd);
-
-                    if (reader != 0)
-                        NativeThread.signal(reader);
-                    if (writer != 0)
-                        NativeThread.signal(writer);
-
-                    // wait for blocking I/O operations to end
-                    while (readerThread != 0 || writerThread != 0) {
-                        try {
-                            stateLock.wait();
-                        } catch (InterruptedException e) {
-                            interrupted = true;
-                        }
-                    }
-                }
-            }
-        } else {
-            // non-blocking mode: wait for read/write to complete
-            readLock.lock();
-            try {
-                writeLock.lock();
-                writeLock.unlock();
-            } finally {
-                readLock.unlock();
-            }
-        }
-
-        // set state to ST_KILLPENDING
+        // wait for any read/write operations to complete before trying to close
+        readLock.lock();
+        readLock.unlock();
+        writeLock.lock();
+        writeLock.unlock();
         synchronized (stateLock) {
-            assert state == ST_CLOSING;
-            state = ST_KILLPENDING;
+            if (state == ST_CLOSING) {
+                tryClose();
+            }
         }
+    }
 
-        // close socket if not registered with Selector
-        if (!isRegistered())
-            kill();
-
-        // restore interrupt status
-        if (interrupted)
-            Thread.currentThread().interrupt();
+    /**
+     * Invoked by implCloseChannel to close the channel.
+     */
+    @Override
+    protected void implCloseSelectableChannel() throws IOException {
+        assert !isOpen();
+        if (isBlocking()) {
+            implCloseBlockingMode();
+        } else {
+            implCloseNonBlockingMode();
+        }
     }
 
     @Override
-    public void kill() throws IOException {
+    public void kill() {
         synchronized (stateLock) {
-            if (state == ST_KILLPENDING) {
-                state = ST_KILLED;
-                try {
-                    nd.close(fd);
-                } finally {
-                    // notify resource manager
-                    ResourceManager.afterUdpClose();
-                }
+            if (state == ST_CLOSING) {
+                tryFinishClose();
             }
         }
     }

@@ -96,8 +96,7 @@ class SocketChannelImpl
     private static final int ST_CONNECTIONPENDING = 1;
     private static final int ST_CONNECTED = 2;
     private static final int ST_CLOSING = 3;
-    private static final int ST_KILLPENDING = 4;
-    private static final int ST_KILLED = 5;
+    private static final int ST_CLOSED = 4;
     private volatile int state;  // need stateLock to change
 
     // IDs of native threads doing reads and writes, for signalling
@@ -261,7 +260,7 @@ class SocketChannelImpl
             }
 
             // no options that require special handling
-            return (T) Net.getSocketOption(fd, Net.UNSPEC, name);
+            return (T) Net.getSocketOption(fd, name);
         }
     }
 
@@ -303,7 +302,7 @@ class SocketChannelImpl
             begin();
 
             synchronized (stateLock) {
-                ensureOpen();
+                ensureOpenAndConnected();
                 // record thread so it can be signalled if needed
                 readerThread = NativeThread.current();
             }
@@ -322,9 +321,8 @@ class SocketChannelImpl
         if (blocking) {
             synchronized (stateLock) {
                 readerThread = 0;
-                // notify any thread waiting in implCloseSelectableChannel
                 if (state == ST_CLOSING) {
-                    stateLock.notifyAll();
+                    tryFinishClose();
                 }
             }
             // remove hook for Thread.interrupt
@@ -413,7 +411,7 @@ class SocketChannelImpl
             begin();
 
             synchronized (stateLock) {
-                ensureOpen();
+                ensureOpenAndConnected();
                 if (isOutputClosed)
                     throw new ClosedChannelException();
                 // record thread so it can be signalled if needed
@@ -434,9 +432,8 @@ class SocketChannelImpl
         if (blocking) {
             synchronized (stateLock) {
                 writerThread = 0;
-                // notify any thread waiting in implCloseSelectableChannel
                 if (state == ST_CLOSING) {
-                    stateLock.notifyAll();
+                    tryFinishClose();
                 }
             }
             // remove hook for Thread.interrupt
@@ -547,6 +544,17 @@ class SocketChannelImpl
             }
         } finally {
             readLock.unlock();
+        }
+    }
+
+    /**
+     * Adjust the blocking mode while holding the readLock or writeLock.
+     */
+    private void lockedConfigureBlocking(boolean block) throws IOException {
+        assert readLock.isHeldByCurrentThread() || writeLock.isHeldByCurrentThread();
+        synchronized (stateLock) {
+            ensureOpen();
+            IOUtil.configureBlocking(fd, block);
         }
     }
 
@@ -796,83 +804,89 @@ class SocketChannelImpl
     }
 
     /**
-     * Invoked by implCloseChannel to close the channel.
-     *
-     * This method waits for outstanding I/O operations to complete. When in
-     * blocking mode, the socket is pre-closed and the threads in blocking I/O
-     * operations are signalled to ensure that the outstanding I/O operations
-     * complete quickly.
-     *
-     * If the socket is connected then it is shutdown by this method. The
-     * shutdown ensures that the peer reads EOF for the case that the socket is
-     * not pre-closed or closed by this method.
-     *
-     * The socket is closed by this method when it is not registered with a
-     * Selector. Note that a channel configured blocking may be registered with
-     * a Selector. This arises when a key is canceled and the channel configured
-     * to blocking mode before the key is flushed from the Selector.
+     * Closes the socket if there are no I/O operations in progress and the
+     * channel is not registered with a Selector.
      */
-    @Override
-    protected void implCloseSelectableChannel() throws IOException {
-        assert !isOpen();
+    private boolean tryClose() throws IOException {
+        assert Thread.holdsLock(stateLock) && state == ST_CLOSING;
+        if ((readerThread == 0) && (writerThread == 0) && !isRegistered()) {
+            state = ST_CLOSED;
+            nd.close(fd);
+            return true;
+        } else {
+            return false;
+        }
+    }
 
-        boolean blocking;
-        boolean connected;
-        boolean interrupted = false;
+    /**
+     * Invokes tryClose to attempt to close the socket.
+     *
+     * This method is used for deferred closing by I/O and Selector operations.
+     */
+    private void tryFinishClose() {
+        try {
+            tryClose();
+        } catch (IOException ignore) { }
+    }
 
-        // set state to ST_CLOSING
+    /**
+     * Closes this channel when configured in blocking mode.
+     *
+     * If there is an I/O operation in progress then the socket is pre-closed
+     * and the I/O threads signalled, in which case the final close is deferred
+     * until all I/O operations complete.
+     *
+     * Note that a channel configured blocking may be registered with a Selector
+     * This arises when a key is canceled and the channel configured to blocking
+     * mode before the key is flushed from the Selector.
+     */
+    private void implCloseBlockingMode() throws IOException {
         synchronized (stateLock) {
             assert state < ST_CLOSING;
-            blocking = isBlocking();
-            connected = (state == ST_CONNECTED);
             state = ST_CLOSING;
-        }
-
-        // wait for any outstanding I/O operations to complete
-        if (blocking) {
-            synchronized (stateLock) {
-                assert state == ST_CLOSING;
+            if (!tryClose()) {
                 long reader = readerThread;
                 long writer = writerThread;
                 if (reader != 0 || writer != 0) {
                     nd.preClose(fd);
-                    connected = false; // fd is no longer connected socket
-
                     if (reader != 0)
                         NativeThread.signal(reader);
                     if (writer != 0)
                         NativeThread.signal(writer);
-
-                    // wait for blocking I/O operations to end
-                    while (readerThread != 0 || writerThread != 0) {
-                        try {
-                            stateLock.wait();
-                        } catch (InterruptedException e) {
-                            interrupted = true;
-                        }
-                    }
                 }
             }
-        } else {
-            // non-blocking mode: wait for read/write to complete
-            readLock.lock();
-            try {
-                writeLock.lock();
-                writeLock.unlock();
-            } finally {
-                readLock.unlock();
-            }
+        }
+    }
+
+    /**
+     * Closes this channel when configured in non-blocking mode.
+     *
+     * If the channel is registered with a Selector then the close is deferred
+     * until the channel is flushed from all Selectors.
+     *
+     * If the socket is connected and the channel is registered with a Selector
+     * then the socket is shutdown for writing so that the peer reads EOF. In
+     * addition, if SO_LINGER is set to a non-zero value then it is disabled so
+     * that the deferred close does not wait.
+     */
+    private void implCloseNonBlockingMode() throws IOException {
+        boolean connected;
+        synchronized (stateLock) {
+            assert state < ST_CLOSING;
+            connected = (state == ST_CONNECTED);
+            state = ST_CLOSING;
         }
 
-        // set state to ST_KILLPENDING
+        // wait for any read/write operations to complete
+        readLock.lock();
+        readLock.unlock();
+        writeLock.lock();
+        writeLock.unlock();
+
+        // if the socket cannot be closed because it's registered with a Selector
+        // then shutdown the socket for writing.
         synchronized (stateLock) {
-            assert state == ST_CLOSING;
-            // if connected and the channel is registered with a Selector then
-            // shutdown the output if possible so that the peer reads EOF. If
-            // SO_LINGER is enabled and set to a non-zero value then it needs to
-            // be disabled so that the Selector does not wait when it closes
-            // the socket.
-            if (connected && isRegistered()) {
+            if (state == ST_CLOSING && !tryClose() && connected && isRegistered()) {
                 try {
                     SocketOption<Integer> opt = StandardSocketOptions.SO_LINGER;
                     int interval = (int) Net.getSocketOption(fd, Net.UNSPEC, opt);
@@ -885,24 +899,27 @@ class SocketChannelImpl
                     }
                 } catch (IOException ignore) { }
             }
-            state = ST_KILLPENDING;
         }
+    }
 
-        // close socket if not registered with Selector
-        if (!isRegistered())
-            kill();
-
-        // restore interrupt status
-        if (interrupted)
-            Thread.currentThread().interrupt();
+    /**
+     * Invoked by implCloseChannel to close the channel.
+     */
+    @Override
+    protected void implCloseSelectableChannel() throws IOException {
+        assert !isOpen();
+        if (isBlocking()) {
+            implCloseBlockingMode();
+        } else {
+            implCloseNonBlockingMode();
+        }
     }
 
     @Override
-    public void kill() throws IOException {
+    public void kill() {
         synchronized (stateLock) {
-            if (state == ST_KILLPENDING) {
-                state = ST_KILLED;
-                nd.close(fd);
+            if (state == ST_CLOSING) {
+                tryFinishClose();
             }
         }
     }
@@ -998,10 +1015,24 @@ class SocketChannelImpl
                 }
                 return polled;
             } finally {
-                writeLock.unlock();
+                endWrite(true, pos >= end);
             }
         } finally {
-            readLock.unlock();
+            writeLock.unlock();
+        }
+    }
+
+    /**
+     * Return the number of bytes in the socket input buffer.
+     */
+    int available() throws IOException {
+        synchronized (stateLock) {
+            ensureOpenAndConnected();
+            if (isInputClosed) {
+                return 0;
+            } else {
+                return Net.available(fd);
+            }
         }
     }
 

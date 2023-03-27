@@ -79,8 +79,7 @@ class ServerSocketChannelImpl
     // Channel state, increases monotonically
     private static final int ST_INUSE = 0;
     private static final int ST_CLOSING = 1;
-    private static final int ST_KILLPENDING = 2;
-    private static final int ST_KILLED = 3;
+    private static final int ST_CLOSED = 2;
     private int state;
 
     // ID of native thread currently blocked in this channel, for signalling
@@ -261,9 +260,8 @@ class ServerSocketChannelImpl
         if (blocking) {
             synchronized (stateLock) {
                 thread = 0;
-                // notify any thread waiting in implCloseSelectableChannel
                 if (state == ST_CLOSING) {
-                    stateLock.notifyAll();
+                    tryFinishClose();
                 }
             }
             end(completed);
@@ -329,78 +327,102 @@ class ServerSocketChannelImpl
     }
 
     /**
-     * Invoked by implCloseChannel to close the channel.
-     *
-     * This method waits for outstanding I/O operations to complete. When in
-     * blocking mode, the socket is pre-closed and the threads in blocking I/O
-     * operations are signalled to ensure that the outstanding I/O operations
-     * complete quickly.
-     *
-     * The socket is closed by this method when it is not registered with a
-     * Selector. Note that a channel configured blocking may be registered with
-     * a Selector. This arises when a key is canceled and the channel configured
-     * to blocking mode before the key is flushed from the Selector.
+     * Adjust the blocking mode while holding acceptLock.
      */
-    @Override
-    protected void implCloseSelectableChannel() throws IOException {
-        assert !isOpen();
+    private void lockedConfigureBlocking(boolean block) throws IOException {
+        assert acceptLock.isHeldByCurrentThread();
+        synchronized (stateLock) {
+            ensureOpen();
+            IOUtil.configureBlocking(fd, block);
+        }
+    }
 
-        boolean interrupted = false;
-        boolean blocking;
+    /**
+     * Closes the socket if there are no accept in progress and the channel is
+     * not registered with a Selector.
+     */
+    private boolean tryClose() throws IOException {
+        assert Thread.holdsLock(stateLock) && state == ST_CLOSING;
+        if ((thread == 0) && !isRegistered()) {
+            state = ST_CLOSED;
+            nd.close(fd);
+            return true;
+        } else {
+            return false;
+        }
+    }
 
-        // set state to ST_CLOSING
+    /**
+     * Invokes tryClose to attempt to close the socket.
+     *
+     * This method is used for deferred closing by I/O and Selector operations.
+     */
+    private void tryFinishClose() {
+        try {
+            tryClose();
+        } catch (IOException ignore) { }
+    }
+
+    /**
+     * Closes this channel when configured in blocking mode.
+     *
+     * If there is an accept in progress then the socket is pre-closed and the
+     * accept thread is signalled, in which case the final close is deferred
+     * until the accept aborts.
+     */
+    private void implCloseBlockingMode() throws IOException {
         synchronized (stateLock) {
             assert state < ST_CLOSING;
             state = ST_CLOSING;
-            blocking = isBlocking();
-        }
-
-        // wait for any outstanding accept to complete
-        if (blocking) {
-            synchronized (stateLock) {
-                assert state == ST_CLOSING;
+            if (!tryClose()) {
                 long th = thread;
                 if (th != 0) {
                     nd.preClose(fd);
                     NativeThread.signal(th);
-
-                    // wait for accept operation to end
-                    while (thread != 0) {
-                        try {
-                            stateLock.wait();
-                        } catch (InterruptedException e) {
-                            interrupted = true;
-                        }
-                    }
                 }
             }
-        } else {
-            // non-blocking mode: wait for accept to complete
-            acceptLock.lock();
-            acceptLock.unlock();
         }
+    }
 
-        // set state to ST_KILLPENDING
+    /**
+     * Closes this channel when configured in non-blocking mode.
+     *
+     * If the channel is registered with a Selector then the close is deferred
+     * until the channel is flushed from all Selectors.
+     */
+    private void implCloseNonBlockingMode() throws IOException {
         synchronized (stateLock) {
-            assert state == ST_CLOSING;
-            state = ST_KILLPENDING;
+            assert state < ST_CLOSING;
+            state = ST_CLOSING;
         }
+        // wait for any accept to complete before trying to close
+        acceptLock.lock();
+        acceptLock.unlock();
+        synchronized (stateLock) {
+            if (state == ST_CLOSING) {
+                tryClose();
+            }
+        }
+    }
 
-        // close socket if not registered with Selector
-        if (!isRegistered())
-            kill();
-
-        // restore interrupt status
-        if (interrupted)
-            Thread.currentThread().interrupt();
+    /**
+     * Invoked by implCloseChannel to close the channel.
+     */
+    @Override
+    protected void implCloseSelectableChannel() throws IOException {
+        assert !isOpen();
+        if (isBlocking()) {
+            implCloseBlockingMode();
+        } else {
+            implCloseNonBlockingMode();
+        }
     }
 
     @Override
-    public void kill() throws IOException {
+    public void kill() {
         synchronized (stateLock) {
-            if (state == ST_KILLPENDING) {
-                state = ST_KILLED;
-                nd.close(fd);
+            if (state == ST_CLOSING) {
+                tryFinishClose();
             }
         }
     }
@@ -420,28 +442,6 @@ class ServerSocketChannelImpl
     InetSocketAddress localAddress() {
         synchronized (stateLock) {
             return localAddress;
-        }
-    }
-
-    /**
-     * Poll this channel's socket for a new connection up to the given timeout.
-     * @return {@code true} if there is a connection to accept
-     */
-    boolean pollAccept(long timeout) throws IOException {
-        assert Thread.holdsLock(blockingLock()) && isBlocking();
-        acceptLock.lock();
-        try {
-            boolean polled = false;
-            try {
-                begin(true);
-                int events = Net.poll(fd, Net.POLLIN, timeout);
-                polled = (events != 0);
-            } finally {
-                end(true, polled);
-            }
-            return polled;
-        } finally {
-            acceptLock.unlock();
         }
     }
 

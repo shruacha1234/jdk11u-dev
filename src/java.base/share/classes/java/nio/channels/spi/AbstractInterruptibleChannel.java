@@ -29,8 +29,12 @@
 package java.nio.channels.spi;
 
 import java.io.IOException;
-import java.nio.channels.*;
-import jdk.internal.misc.SharedSecrets;
+import java.nio.channels.AsynchronousCloseException;
+import java.nio.channels.Channel;
+import java.nio.channels.ClosedByInterruptException;
+import java.nio.channels.InterruptibleChannel;
+
+import jdk.internal.access.SharedSecrets;
 import sun.nio.ch.Interruptible;
 
 
@@ -84,7 +88,6 @@ import sun.nio.ch.Interruptible;
 public abstract class AbstractInterruptibleChannel
     implements Channel, InterruptibleChannel
 {
-
     private final Object closeLock = new Object();
     private volatile boolean closed;
 
