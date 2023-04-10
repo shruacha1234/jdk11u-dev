@@ -33,6 +33,7 @@ import java.net.ProtocolFamily;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.net.SocketOption;
+import java.net.SocketTimeoutException;
 import java.net.StandardProtocolFamily;
 import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
@@ -41,6 +42,7 @@ import java.nio.channels.AlreadyConnectedException;
 import java.nio.channels.AsynchronousCloseException;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.ConnectionPendingException;
+import java.nio.channels.IllegalBlockingModeException;
 import java.nio.channels.NoConnectionPendingException;
 import java.nio.channels.NotYetConnectedException;
 import java.nio.channels.SelectionKey;
@@ -50,6 +52,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 import sun.net.NetHooks;
@@ -80,7 +83,8 @@ class SocketChannelImpl
 
     // Lock held by any thread that modifies the state fields declared below
     // DO NOT invoke a blocking I/O operation while holding this lock!
-    private final Object stateLock = new Object();
+    private final ReentrantLock stateLock = new ReentrantLock();
+    private final Condition stateCondition = stateLock.newCondition();
 
     // Input/Output closed
     private volatile boolean isInputClosed;
@@ -129,8 +133,11 @@ class SocketChannelImpl
         this.fd = fd;
         this.fdVal = IOUtil.fdVal(fd);
         if (bound) {
-            synchronized (stateLock) {
+            stateLock.lock();
+            try {
                 this.localAddress = Net.localAddress(fd);
+            } finally {
+                stateLock.unlock();
             }
         }
     }
@@ -143,10 +150,13 @@ class SocketChannelImpl
         super(sp);
         this.fd = fd;
         this.fdVal = IOUtil.fdVal(fd);
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             this.localAddress = Net.localAddress(fd);
             this.remoteAddress = isa;
             this.state = ST_CONNECTED;
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -183,26 +193,35 @@ class SocketChannelImpl
 
     @Override
     public Socket socket() {
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             if (socket == null)
                 socket = SocketAdaptor.create(this);
             return socket;
+        } finally {
+            stateLock.unlock();
         }
     }
 
     @Override
     public SocketAddress getLocalAddress() throws IOException {
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             ensureOpen();
             return Net.getRevealedLocalAddress(localAddress);
+        } finally {
+            stateLock.unlock();
         }
     }
 
     @Override
     public SocketAddress getRemoteAddress() throws IOException {
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             ensureOpen();
             return remoteAddress;
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -214,7 +233,8 @@ class SocketChannelImpl
         if (!supportedOptions().contains(name))
             throw new UnsupportedOperationException("'" + name + "' not supported");
 
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             ensureOpen();
 
             if (name == StandardSocketOptions.IP_TOS) {
@@ -233,6 +253,8 @@ class SocketChannelImpl
             // no options that require special handling
             Net.setSocketOption(fd, Net.UNSPEC, name, value);
             return this;
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -245,7 +267,8 @@ class SocketChannelImpl
         if (!supportedOptions().contains(name))
             throw new UnsupportedOperationException("'" + name + "' not supported");
 
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             ensureOpen();
 
             if (name == StandardSocketOptions.SO_REUSEADDR && Net.useExclusiveBind()) {
@@ -262,6 +285,8 @@ class SocketChannelImpl
 
             // no options that require special handling
             return (T) Net.getSocketOption(fd, Net.UNSPEC, name);
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -302,10 +327,13 @@ class SocketChannelImpl
             // set hook for Thread.interrupt
             begin();
 
-            synchronized (stateLock) {
-                ensureOpen();
+            stateLock.lock();
+            try {
+                ensureOpenAndConnected();
                 // record thread so it can be signalled if needed
                 readerThread = NativeThread.current();
+            } finally {
+                stateLock.unlock();
             }
         }
     }
@@ -320,12 +348,15 @@ class SocketChannelImpl
         throws AsynchronousCloseException
     {
         if (blocking) {
-            synchronized (stateLock) {
+            stateLock.lock();
+            try {
                 readerThread = 0;
                 // notify any thread waiting in implCloseSelectableChannel
                 if (state == ST_CLOSING) {
-                    stateLock.notifyAll();
+                    stateCondition.signalAll();
                 }
+            } finally {
+                stateLock.unlock();
             }
             // remove hook for Thread.interrupt
             end(completed);
@@ -348,12 +379,12 @@ class SocketChannelImpl
                 if (isInputClosed)
                     return IOStatus.EOF;
 
+                n = IOUtil.read(fd, buf, -1, nd);
                 if (blocking) {
-                    do {
+                    while (IOStatus.okayToRetry(n) && isOpen()) {
+                        park(Net.POLLIN);
                         n = IOUtil.read(fd, buf, -1, nd);
-                    } while (n == IOStatus.INTERRUPTED && isOpen());
-                } else {
-                    n = IOUtil.read(fd, buf, -1, nd);
+                    }
                 }
             } finally {
                 endRead(blocking, n > 0);
@@ -384,12 +415,12 @@ class SocketChannelImpl
                 if (isInputClosed)
                     return IOStatus.EOF;
 
+                n = IOUtil.read(fd, dsts, offset, length, nd);
                 if (blocking) {
-                    do {
+                    while (IOStatus.okayToRetry(n) && isOpen()) {
+                        park(Net.POLLIN);
                         n = IOUtil.read(fd, dsts, offset, length, nd);
-                    } while (n == IOStatus.INTERRUPTED && isOpen());
-                } else {
-                    n = IOUtil.read(fd, dsts, offset, length, nd);
+                    }
                 }
             } finally {
                 endRead(blocking, n > 0);
@@ -412,12 +443,15 @@ class SocketChannelImpl
             // set hook for Thread.interrupt
             begin();
 
-            synchronized (stateLock) {
-                ensureOpen();
+            stateLock.lock();
+            try {
+                ensureOpenAndConnected();
                 if (isOutputClosed)
                     throw new ClosedChannelException();
                 // record thread so it can be signalled if needed
                 writerThread = NativeThread.current();
+            } finally {
+                stateLock.unlock();
             }
         }
     }
@@ -432,12 +466,15 @@ class SocketChannelImpl
         throws AsynchronousCloseException
     {
         if (blocking) {
-            synchronized (stateLock) {
+            stateLock.lock();
+            try {
                 writerThread = 0;
                 // notify any thread waiting in implCloseSelectableChannel
                 if (state == ST_CLOSING) {
-                    stateLock.notifyAll();
+                    stateCondition.signalAll();
                 }
+            } finally {
+                stateLock.unlock();
             }
             // remove hook for Thread.interrupt
             end(completed);
@@ -454,12 +491,12 @@ class SocketChannelImpl
             int n = 0;
             try {
                 beginWrite(blocking);
+                n = IOUtil.write(fd, buf, -1, nd);
                 if (blocking) {
-                    do {
+                    while (IOStatus.okayToRetry(n) && isOpen()) {
+                        park(Net.POLLOUT);
                         n = IOUtil.write(fd, buf, -1, nd);
-                    } while (n == IOStatus.INTERRUPTED && isOpen());
-                } else {
-                    n = IOUtil.write(fd, buf, -1, nd);
+                    }
                 }
             } finally {
                 endWrite(blocking, n > 0);
@@ -485,12 +522,12 @@ class SocketChannelImpl
             long n = 0;
             try {
                 beginWrite(blocking);
+                n = IOUtil.write(fd, srcs, offset, length, nd);
                 if (blocking) {
-                    do {
+                    while (IOStatus.okayToRetry(n) && isOpen()) {
+                        park(Net.POLLOUT);
                         n = IOUtil.write(fd, srcs, offset, length, nd);
-                    } while (n == IOStatus.INTERRUPTED && isOpen());
-                } else {
-                    n = IOUtil.write(fd, srcs, offset, length, nd);
+                    }
                 }
             } finally {
                 endWrite(blocking, n > 0);
@@ -538,10 +575,7 @@ class SocketChannelImpl
         try {
             writeLock.lock();
             try {
-                synchronized (stateLock) {
-                    ensureOpen();
-                    IOUtil.configureBlocking(fd, block);
-                }
+                lockedConfigureBlocking(block);
             } finally {
                 writeLock.unlock();
             }
@@ -551,11 +585,28 @@ class SocketChannelImpl
     }
 
     /**
+     * Adjust the blocking mode while holding the readLock or writeLock.
+     */
+    private void lockedConfigureBlocking(boolean block) throws IOException {
+        assert readLock.isHeldByCurrentThread() || writeLock.isHeldByCurrentThread();
+        stateLock.lock();
+        try {
+            ensureOpen();
+            IOUtil.configureBlocking(fd, block);
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    /**
      * Returns the local address, or null if not bound
      */
     InetSocketAddress localAddress() {
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             return localAddress;
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -563,8 +614,11 @@ class SocketChannelImpl
      * Returns the remote address, or null if not connected
      */
     InetSocketAddress remoteAddress() {
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             return remoteAddress;
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -574,7 +628,8 @@ class SocketChannelImpl
         try {
             writeLock.lock();
             try {
-                synchronized (stateLock) {
+                stateLock.lock();
+                try {
                     ensureOpen();
                     if (state == ST_CONNECTIONPENDING)
                         throw new ConnectionPendingException();
@@ -589,6 +644,8 @@ class SocketChannelImpl
                     NetHooks.beforeTcpBind(fd, isa.getAddress(), isa.getPort());
                     Net.bind(fd, isa.getAddress(), isa.getPort());
                     localAddress = Net.localAddress(fd);
+                } finally {
+                    stateLock.unlock();
                 }
             } finally {
                 writeLock.unlock();
@@ -625,7 +682,8 @@ class SocketChannelImpl
             // set hook for Thread.interrupt
             begin();
         }
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             ensureOpen();
             int state = this.state;
             if (state == ST_CONNECTED)
@@ -643,6 +701,8 @@ class SocketChannelImpl
                 // record thread so it can be signalled if needed
                 readerThread = NativeThread.current();
             }
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -659,43 +719,62 @@ class SocketChannelImpl
         endRead(blocking, completed);
 
         if (completed) {
-            synchronized (stateLock) {
+            stateLock.lock();
+            try {
                 if (state == ST_CONNECTIONPENDING) {
                     localAddress = Net.localAddress(fd);
                     state = ST_CONNECTED;
                 }
+            } finally {
+                stateLock.unlock();
             }
         }
     }
 
-    @Override
-    public boolean connect(SocketAddress sa) throws IOException {
+    /**
+     * Checks the remote address to which this channel is to be connected.
+     */
+    private InetSocketAddress checkRemote(SocketAddress sa) throws IOException {
         InetSocketAddress isa = Net.checkAddress(sa);
         SecurityManager sm = System.getSecurityManager();
-        if (sm != null)
+        if (sm != null) {
             sm.checkConnect(isa.getAddress().getHostAddress(), isa.getPort());
+        }
+        if (isa.getAddress().isAnyLocalAddress()) {
+            return new InetSocketAddress(InetAddress.getLocalHost(), isa.getPort());
+        } else {
+            return isa;
+        }
+    }
 
-        InetAddress ia = isa.getAddress();
-        if (ia.isAnyLocalAddress())
-            ia = InetAddress.getLocalHost();
-
+    @Override
+    public boolean connect(SocketAddress remote) throws IOException {
+        InetSocketAddress isa = checkRemote(remote);
         try {
             readLock.lock();
             try {
                 writeLock.lock();
                 try {
-                    int n = 0;
                     boolean blocking = isBlocking();
+                    boolean connected = false;
                     try {
                         beginConnect(blocking, isa);
-                        do {
-                            n = Net.connect(fd, ia, isa.getPort());
-                        } while (n == IOStatus.INTERRUPTED && isOpen());
+                        int n = Net.connect(fd, isa.getAddress(), isa.getPort());
+                        if (n > 0) {
+                            connected = true;
+                        } else if (blocking) {
+                            assert IOStatus.okayToRetry(n);
+                            boolean polled = false;
+                            while (!polled && isOpen()) {
+                                park(Net.POLLOUT);
+                                polled = Net.pollConnectNow(fd);
+                            }
+                            connected = polled && isOpen();
+                        }
                     } finally {
-                        endConnect(blocking, (n > 0));
+                        endConnect(blocking, connected);
                     }
-                    assert IOStatus.check(n);
-                    return n > 0;
+                    return connected;
                 } finally {
                     writeLock.unlock();
                 }
@@ -720,7 +799,8 @@ class SocketChannelImpl
             // set hook for Thread.interrupt
             begin();
         }
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             ensureOpen();
             if (state != ST_CONNECTIONPENDING)
                 throw new NoConnectionPendingException();
@@ -728,6 +808,8 @@ class SocketChannelImpl
                 // record thread so it can be signalled if needed
                 readerThread = NativeThread.current();
             }
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -744,11 +826,14 @@ class SocketChannelImpl
         endRead(blocking, completed);
 
         if (completed) {
-            synchronized (stateLock) {
+            stateLock.lock();
+            try {
                 if (state == ST_CONNECTIONPENDING) {
                     localAddress = Net.localAddress(fd);
                     state = ST_CONNECTED;
                 }
+            } finally {
+                stateLock.unlock();
             }
         }
     }
@@ -768,15 +853,14 @@ class SocketChannelImpl
                     boolean connected = false;
                     try {
                         beginFinishConnect(blocking);
-                        int n = 0;
+                        boolean polled = Net.pollConnectNow(fd);
                         if (blocking) {
-                            do {
-                                n = checkConnect(fd, true);
-                            } while ((n == 0 || n == IOStatus.INTERRUPTED) && isOpen());
-                        } else {
-                            n = checkConnect(fd, false);
+                            while (!polled && isOpen()) {
+                                park(Net.POLLOUT);
+                                polled = Net.pollConnectNow(fd);
+                            }
                         }
-                        connected = (n > 0);
+                        connected = polled && isOpen();
                     } finally {
                         endFinishConnect(blocking, connected);
                     }
@@ -821,16 +905,20 @@ class SocketChannelImpl
         boolean interrupted = false;
 
         // set state to ST_CLOSING
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             assert state < ST_CLOSING;
             blocking = isBlocking();
             connected = (state == ST_CONNECTED);
             state = ST_CLOSING;
+        } finally {
+            stateLock.unlock();
         }
 
         // wait for any outstanding I/O operations to complete
         if (blocking) {
-            synchronized (stateLock) {
+            stateLock.lock();
+            try {
                 assert state == ST_CLOSING;
                 long reader = readerThread;
                 long writer = writerThread;
@@ -846,12 +934,14 @@ class SocketChannelImpl
                     // wait for blocking I/O operations to end
                     while (readerThread != 0 || writerThread != 0) {
                         try {
-                            stateLock.wait();
+                            stateCondition.await();
                         } catch (InterruptedException e) {
                             interrupted = true;
                         }
                     }
                 }
+            } finally {
+                stateLock.unlock();
             }
         } else {
             // non-blocking mode: wait for read/write to complete
@@ -865,7 +955,8 @@ class SocketChannelImpl
         }
 
         // set state to ST_KILLPENDING
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             assert state == ST_CLOSING;
             // if connected and the channel is registered with a Selector then
             // shutdown the output if possible so that the peer reads EOF. If
@@ -886,6 +977,8 @@ class SocketChannelImpl
                 } catch (IOException ignore) { }
             }
             state = ST_KILLPENDING;
+        } finally {
+            stateLock.unlock();
         }
 
         // close socket if not registered with Selector
@@ -899,17 +992,21 @@ class SocketChannelImpl
 
     @Override
     public void kill() throws IOException {
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             if (state == ST_KILLPENDING) {
                 state = ST_KILLED;
                 nd.close(fd);
             }
+        } finally {
+            stateLock.unlock();
         }
     }
 
     @Override
     public SocketChannel shutdownInput() throws IOException {
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             ensureOpen();
             if (!isConnected())
                 throw new NotYetConnectedException();
@@ -921,12 +1018,15 @@ class SocketChannelImpl
                 isInputClosed = true;
             }
             return this;
+        } finally {
+            stateLock.unlock();
         }
     }
 
     @Override
     public SocketChannel shutdownOutput() throws IOException {
-        synchronized (stateLock) {
+        stateLock.lock();
+        try {
             ensureOpen();
             if (!isConnected())
                 throw new NotYetConnectedException();
@@ -938,6 +1038,8 @@ class SocketChannelImpl
                 isOutputClosed = true;
             }
             return this;
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -950,58 +1052,240 @@ class SocketChannelImpl
     }
 
     /**
-     * Poll this channel's socket for reading up to the given timeout.
-     * @return {@code true} if the socket is polled
+     * Waits for a connection attempt to finish with a timeout
+     * @throws SocketTimeoutException if the connect timeout elapses
      */
-    boolean pollRead(long timeout) throws IOException {
-        boolean blocking = isBlocking();
-        assert Thread.holdsLock(blockingLock()) && blocking;
+    private boolean finishTimedConnect(long nanos) throws IOException {
+        long startNanos = System.nanoTime();
+        boolean polled = Net.pollConnectNow(fd);
+        while (!polled && isOpen()) {
+            long remainingNanos = nanos - (System.nanoTime() - startNanos);
+            if (remainingNanos <= 0) {
+                throw new SocketTimeoutException("Connect timed out");
+            }
+            park(Net.POLLOUT, remainingNanos);
+            polled = Net.pollConnectNow(fd);
+        }
+        return polled && isOpen();
+    }
+
+    /**
+     * Attempts to establish a connection to the given socket address with a
+     * timeout. Closes the socket if connection cannot be established.
+     *
+     * @apiNote This method is for use by the socket adaptor.
+     *
+     * @throws IllegalBlockingModeException if the channel is non-blocking
+     * @throws SocketTimeoutException if the read timeout elapses
+     */
+    void blockingConnect(SocketAddress remote, long nanos) throws IOException {
+        InetSocketAddress isa = checkRemote(remote);
+        try {
+            readLock.lock();
+            try {
+                writeLock.lock();
+                try {
+                    if (!isBlocking())
+                        throw new IllegalBlockingModeException();
+                    boolean connected = false;
+                    try {
+                        beginConnect(true, isa);
+                        // change socket to non-blocking
+                        lockedConfigureBlocking(false);
+                        try {
+                            int n = Net.connect(fd, isa.getAddress(), isa.getPort());
+                            connected = (n > 0) ? true : finishTimedConnect(nanos);
+                        } finally {
+                            // restore socket to blocking mode
+                            lockedConfigureBlocking(true);
+                        }
+                    } finally {
+                        endConnect(true, connected);
+                    }
+                } finally {
+                    writeLock.unlock();
+                }
+            } finally {
+                readLock.unlock();
+            }
+        } catch (IOException ioe) {
+            // connect failed, close the channel
+            close();
+            throw SocketExceptions.of(ioe, isa);
+        }
+    }
+
+    /**
+     * Attempts to read bytes from the socket into the given byte array.
+     */
+    private int tryRead(byte[] b, int off, int len) throws IOException {
+        ByteBuffer dst = Util.getTemporaryDirectBuffer(len);
+        assert dst.position() == 0;
+        try {
+            int n = nd.read(fd, ((DirectBuffer)dst).address(), len);
+            if (n > 0) {
+                dst.get(b, off, n);
+            }
+            return n;
+        } finally{
+            Util.offerFirstTemporaryDirectBuffer(dst);
+        }
+    }
+
+    /**
+     * Reads bytes from the socket into the given byte array with a timeout.
+     * @throws SocketTimeoutException if the read timeout elapses
+     */
+    private int timedRead(byte[] b, int off, int len, long nanos) throws IOException {
+        long startNanos = System.nanoTime();
+        int n = tryRead(b, off, len);
+        while (n == IOStatus.UNAVAILABLE && isOpen()) {
+            long remainingNanos = nanos - (System.nanoTime() - startNanos);
+            if (remainingNanos <= 0) {
+                throw new SocketTimeoutException("Read timed out");
+            }
+            park(Net.POLLIN, remainingNanos);
+            n = tryRead(b, off, len);
+        }
+        return n;
+    }
+
+    /**
+     * Reads bytes from the socket into the given byte array.
+     *
+     * @apiNote This method is for use by the socket adaptor.
+     *
+     * @throws IllegalBlockingModeException if the channel is non-blocking
+     * @throws SocketTimeoutException if the read timeout elapses
+     */
+    int blockingRead(byte[] b, int off, int len, long nanos) throws IOException {
+        Objects.checkFromIndexSize(off, len, b.length);
+        if (len == 0) {
+            // nothing to do
+            return 0;
+        }
 
         readLock.lock();
         try {
-            boolean polled = false;
+            // check that channel is configured blocking
+            if (!isBlocking())
+                throw new IllegalBlockingModeException();
+
+            int n = 0;
             try {
-                beginRead(blocking);
-                int events = Net.poll(fd, Net.POLLIN, timeout);
-                polled = (events != 0);
+                beginRead(true);
+
+                // check if connection has been reset
+                if (connectionReset)
+                    throwConnectionReset();
+
+                // check if input is shutdown
+                if (isInputClosed)
+                    return IOStatus.EOF;
+
+                if (nanos > 0) {
+                    // change socket to non-blocking
+                    lockedConfigureBlocking(false);
+                    try {
+                        n = timedRead(b, off, len, nanos);
+                    } finally {
+                        // restore socket to blocking mode
+                        lockedConfigureBlocking(true);
+                    }
+                } else {
+                    // read, no timeout
+                    n = tryRead(b, off, len);
+                    while (IOStatus.okayToRetry(n) && isOpen()) {
+                        park(Net.POLLIN);
+                        n = tryRead(b, off, len);
+                    }
+                }
+            } catch (ConnectionResetException e) {
+                connectionReset = true;
+                throwConnectionReset();
             } finally {
-                endRead(blocking, polled);
+                endRead(true, n > 0);
+                if (n <= 0 && isInputClosed)
+                    return IOStatus.EOF;
             }
-            return polled;
+            assert n > 0 || n == -1;
+            return n;
         } finally {
             readLock.unlock();
         }
     }
 
     /**
-     * Poll this channel's socket for a connection, up to the given timeout.
-     * @return {@code true} if the socket is polled
+     * Attempts to write a sequence of bytes to the socket from the given
+     * byte array.
      */
-    boolean pollConnected(long timeout) throws IOException {
-        boolean blocking = isBlocking();
-        assert Thread.holdsLock(blockingLock()) && blocking;
-
-        readLock.lock();
+    private int tryWrite(byte[] b, int off, int len) throws IOException {
+        ByteBuffer src = Util.getTemporaryDirectBuffer(len);
+        assert src.position() == 0;
         try {
-            writeLock.lock();
+            src.put(b, off, len);
+            return nd.write(fd, ((DirectBuffer)src).address(), len);
+        } finally {
+            Util.offerFirstTemporaryDirectBuffer(src);
+        }
+    }
+
+    /**
+     * Writes a sequence of bytes to the socket from the given byte array.
+     *
+     * @apiNote This method is for use by the socket adaptor.
+     */
+    void blockingWriteFully(byte[] b, int off, int len) throws IOException {
+        Objects.checkFromIndexSize(off, len, b.length);
+        if (len == 0) {
+            // nothing to do
+            return;
+        }
+
+        writeLock.lock();
+        try {
+            // check that channel is configured blocking
+            if (!isBlocking())
+                throw new IllegalBlockingModeException();
+
+            // loop until all bytes have been written
+            int pos = off;
+            int end = off + len;
+            beginWrite(true);
             try {
-                boolean polled = false;
-                try {
-                    beginFinishConnect(blocking);
-                    int events = Net.poll(fd, Net.POLLCONN, timeout);
-                    polled = (events != 0);
-                } finally {
-                    // invoke endFinishConnect with completed = false so that
-                    // the state is not changed to ST_CONNECTED. The socket
-                    // adaptor will use finishConnect to finish.
-                    endFinishConnect(blocking, /*completed*/false);
+                while (pos < end && isOpen()) {
+                    int size = end - pos;
+                    int n = tryWrite(b, pos, size);
+                    while (IOStatus.okayToRetry(n) && isOpen()) {
+                        park(Net.POLLOUT);
+                        n = tryWrite(b, pos, size);
+                    }
+                    if (n > 0) {
+                        pos += n;
+                    }
                 }
-                return polled;
             } finally {
-                writeLock.unlock();
+                endWrite(true, pos >= end);
             }
         } finally {
-            readLock.unlock();
+            writeLock.unlock();
+        }
+    }
+
+    /**
+     * Return the number of bytes in the socket input buffer.
+     */
+    int available() throws IOException {
+        stateLock.lock();
+        try {
+            ensureOpenAndConnected();
+            if (isInputClosed) {
+                return 0;
+            } else {
+                return Net.available(fd);
+            }
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -1081,7 +1365,8 @@ class SocketChannelImpl
         if (!isOpen())
             sb.append("closed");
         else {
-            synchronized (stateLock) {
+            stateLock.lock();
+            try {
                 switch (state) {
                 case ST_UNCONNECTED:
                     sb.append("unconnected");
@@ -1106,6 +1391,8 @@ class SocketChannelImpl
                     sb.append(" remote=");
                     sb.append(remoteAddress().toString());
                 }
+            } finally {
+                stateLock.unlock();
             }
         }
         sb.append(']');
